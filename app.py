@@ -4370,205 +4370,225 @@ def _fmt_qty(v):
 
 
 def export_excel(bundle: ReportBundle) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.page import PageMargins
+
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="mm/dd/yyyy") as writer:
-        wb = writer.book
+    wb = Workbook()
+    sheet = wb.active
+    sheet.title = "ITEM ACTIVITY"
 
-        navy = "#17365D"
-        blue = "#1F4E78"
-        light_blue = "#D9EAF7"
-        very_light_blue = "#F4F8FC"
-        light_gray = "#F3F6F8"
-        green = "#E2F0D9"
-        white = "#FFFFFF"
-        border = "#D9E1F2"
-        dark_text = "#243447"
+    navy = "17365D"
+    blue = "1F4E78"
+    light_blue = "D9EAF7"
+    very_light_blue = "F4F8FC"
+    light_gray = "F3F6F8"
+    green = "E2F0D9"
+    white = "FFFFFF"
+    border_color = "D9E1F2"
+    dark_text = "243447"
 
-        title_fmt = wb.add_format({
-            "bold": True, "font_size": 18, "font_color": white,
-            "bg_color": navy, "align": "left", "valign": "vcenter"
-        })
-        subtitle_fmt = wb.add_format({
-            "font_size": 10, "font_color": "#44546A",
-            "bg_color": "#EAF2F8", "valign": "vcenter"
-        })
-        header_fmt = wb.add_format({
-            "bold": True, "font_color": white, "bg_color": blue,
-            "border": 1, "border_color": white,
-            "align": "center", "valign": "vcenter", "text_wrap": True
-        })
-        item_fmt = wb.add_format({
-            "bold": True, "font_color": dark_text, "bg_color": light_blue,
-            "top": 1, "bottom": 1, "border_color": border, "valign": "vcenter"
-        })
-        item_num_fmt = wb.add_format({
-            "bold": True, "font_color": dark_text, "bg_color": light_blue,
-            "top": 1, "bottom": 1, "border_color": border,
-            "num_format": "#,##0.####", "valign": "vcenter"
-        })
-        begin_fmt = wb.add_format({
-            "bold": True, "bg_color": very_light_blue,
-            "border": 1, "border_color": border, "font_color": dark_text
-        })
-        end_fmt = wb.add_format({
-            "bold": True, "bg_color": green,
-            "border": 1, "border_color": border, "font_color": "#375623"
-        })
-        total_fmt = wb.add_format({
-            "bold": True, "bg_color": light_gray,
-            "border": 1, "border_color": border, "font_color": dark_text
-        })
-        tx_fmt = wb.add_format({"border": 1, "border_color": border})
-        tx_date_fmt = wb.add_format({
-            "border": 1, "border_color": border, "num_format": "mm/dd/yyyy"
-        })
-        tx_num_fmt = wb.add_format({
-            "border": 1, "border_color": border, "num_format": "#,##0.####"
-        })
+    thin = Side(style="thin", color=border_color)
+    white_thin = Side(style="thin", color=white)
+    body_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_border = Border(left=white_thin, right=white_thin, top=white_thin, bottom=white_thin)
 
-        optional_order = ["Qualifier", "SubInventory", "Locator"]
-        optional_present = []
-        for col in optional_order:
-            if col in bundle.activity.columns:
-                values = bundle.activity[col].fillna("").astype(str).str.strip()
-                if values.ne("").any():
-                    optional_present.append(col)
+    title_fill = PatternFill("solid", fgColor=navy)
+    subtitle_fill = PatternFill("solid", fgColor="EAF2F8")
+    header_fill = PatternFill("solid", fgColor=blue)
+    item_fill = PatternFill("solid", fgColor=light_blue)
+    begin_fill = PatternFill("solid", fgColor=very_light_blue)
+    end_fill = PatternFill("solid", fgColor=green)
+    total_fill = PatternFill("solid", fgColor=light_gray)
 
-                                                                                  
-        headers = ["SKU"]
-        if "Qualifier" in optional_present:
-            headers.append("Qualifier")
-        headers += [
-            "Item Description", "Packed", "Activity Date", "Trans. #", "Ref #",
-            "Qty in / Ctn", "Qty out / Ctn"
-        ]
-        if "SubInventory" in optional_present:
-            headers.append("SubInventory")
-        if "Locator" in optional_present:
-            headers.append("Locator")
-        headers += ["Balance", "Ctn Balance"]
+    optional_order = ["Qualifier", "SubInventory", "Locator"]
+    optional_present = []
+    for col in optional_order:
+        if col in bundle.activity.columns:
+            values = bundle.activity[col].fillna("").astype(str).str.strip()
+            if values.ne("").any():
+                optional_present.append(col)
 
-        col_index = {name: idx for idx, name in enumerate(headers)}
-        last_col = len(headers) - 1
+    headers = ["SKU"]
+    if "Qualifier" in optional_present:
+        headers.append("Qualifier")
+    headers += [
+        "Item Description", "Packed", "Activity Date", "Trans. #", "Ref #",
+        "Qty in / Ctn", "Qty out / Ctn"
+    ]
+    if "SubInventory" in optional_present:
+        headers.append("SubInventory")
+    if "Locator" in optional_present:
+        headers.append("Locator")
+    headers += ["Balance", "Ctn Balance"]
 
-        sheet = wb.add_worksheet("ITEM ACTIVITY")
-        writer.sheets["ITEM ACTIVITY"] = sheet
-        sheet.hide_gridlines(2)
-        sheet.set_landscape()
-        sheet.fit_to_pages(1, 0)
-        sheet.repeat_rows(0, 4)
-        sheet.set_margins(left=0.25, right=0.25, top=0.5, bottom=0.5)
+    col_index = {name: idx + 1 for idx, name in enumerate(headers)}
+    last_col = len(headers)
+    last_letter = get_column_letter(last_col)
 
-        sheet.set_row(0, 28)
-        sheet.merge_range(0, 0, 0, last_col, "ORLANDO ITEM ACTIVITY REPORT", title_fmt)
-        sheet.merge_range(1, 0, 1, last_col, "Warehouse: Orlando", subtitle_fmt)
-        sheet.merge_range(
-            2, 0, 2, last_col,
-            f"Activity From: {bundle.migration_datetime:%m/%d/%Y}   |   "
-            f"Through: {bundle.snapshot_datetime:%m/%d/%Y}   |   "
-            f"Opening Reference: {bundle.migration_ref}",
-            subtitle_fmt,
+    sheet.sheet_view.showGridLines = False
+    sheet.page_setup.orientation = "landscape"
+    sheet.page_setup.fitToWidth = 1
+    sheet.page_setup.fitToHeight = 0
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    sheet.print_title_rows = "1:5"
+    sheet.page_margins = PageMargins(left=0.25, right=0.25, top=0.5, bottom=0.5)
+
+    sheet.row_dimensions[1].height = 28
+    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
+    c = sheet.cell(1, 1, "ORLANDO ITEM ACTIVITY REPORT")
+    c.font = Font(bold=True, size=18, color=white)
+    c.fill = title_fill
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    for col in range(1, last_col + 1):
+        sheet.cell(1, col).fill = title_fill
+
+    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
+    c = sheet.cell(2, 1, "Warehouse: Orlando")
+    c.font = Font(size=10, color="44546A")
+    c.fill = subtitle_fill
+    c.alignment = Alignment(vertical="center")
+    for col in range(1, last_col + 1):
+        sheet.cell(2, col).fill = subtitle_fill
+
+    sheet.merge_cells(start_row=3, start_column=1, end_row=3, end_column=last_col)
+    c = sheet.cell(3, 1,
+        f"Activity From: {bundle.migration_datetime:%m/%d/%Y}   |   "
+        f"Through: {bundle.snapshot_datetime:%m/%d/%Y}   |   "
+        f"Opening Reference: {bundle.migration_ref}"
+    )
+    c.font = Font(size=10, color="44546A")
+    c.fill = subtitle_fill
+    c.alignment = Alignment(vertical="center")
+    for col in range(1, last_col + 1):
+        sheet.cell(3, col).fill = subtitle_fill
+
+    for idx, h in enumerate(headers, start=1):
+        c = sheet.cell(5, idx, h)
+        c.font = Font(bold=True, color=white)
+        c.fill = header_fill
+        c.border = header_border
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    sheet.row_dimensions[5].height = 32
+
+    rowx = 6
+    for sku, group in bundle.activity.groupby("SKU", sort=False):
+        first = group.iloc[0]
+        packed = float(first["Packed"]) if pd.notna(first["Packed"]) else 0.0
+
+        for col in range(1, last_col + 1):
+            c = sheet.cell(rowx, col)
+            c.fill = item_fill
+            c.font = Font(bold=True, color=dark_text)
+            c.border = Border(top=thin, bottom=thin)
+            c.alignment = Alignment(vertical="center")
+        sheet.cell(rowx, col_index["SKU"], sku)
+        sheet.cell(rowx, col_index["Item Description"], first["Description"])
+        pc = sheet.cell(rowx, col_index["Packed"], packed)
+        pc.number_format = "#,##0.####"
+        rowx += 1
+
+        tx_only = group[group["Type"].isin(["IN", "OUT"])].copy()
+        total_in = float(tx_only["Qty In"].sum()) if not tx_only.empty else 0.0
+        total_out = float(tx_only["Qty Out"].sum()) if not tx_only.empty else 0.0
+        total_in_ctn = sum(
+            abs(_pack_ctn(float(q), packed) or 0)
+            for q in tx_only.loc[tx_only["Qty In"] > 0, "Qty In"]
+        )
+        total_out_ctn = sum(
+            abs(_pack_ctn(float(q), packed) or 0)
+            for q in tx_only.loc[tx_only["Qty Out"] > 0, "Qty Out"]
         )
 
-        for c, h in enumerate(headers):
-            sheet.write(4, c, h, header_fmt)
-        sheet.set_row(4, 32)
+        ending_balance = None
+        ending_ctn = None
 
-        rowx = 5
-        for sku, group in bundle.activity.groupby("SKU", sort=False):
-            first = group.iloc[0]
-            packed = float(first["Packed"]) if pd.notna(first["Packed"]) else 0.0
+        for _, tr in group.iterrows():
+            is_begin = tr["Type"] == "BEGINNING"
+            is_end = tr["Type"] == "ENDING"
+            fill = begin_fill if is_begin else end_fill if is_end else PatternFill(fill_type=None)
+            font = Font(bold=True, color=dark_text) if is_begin else Font(bold=True, color="375623") if is_end else Font(color="000000")
 
-            for c in range(len(headers)):
-                sheet.write_blank(rowx, c, None, item_fmt)
-            sheet.write(rowx, col_index["SKU"], sku, item_fmt)
-            sheet.write(rowx, col_index["Item Description"], first["Description"], item_fmt)
-            sheet.write_number(rowx, col_index["Packed"], packed, item_num_fmt)
+            row_values = {h: "" for h in headers}
+            if is_begin:
+                row_values["Activity Date"] = "Beginning Balance"
+            elif is_end:
+                row_values["Activity Date"] = "Ending Balance"
+            else:
+                row_values["Activity Date"] = tr["Activity Date"]
+                row_values["Trans. #"] = tr["Trans. #"]
+                row_values["Ref #"] = tr["Ref #"]
+                for col in optional_present:
+                    row_values[col] = tr.get(col, "")
+
+            row_values["Qty in / Ctn"] = tr["Qty In / Ctn"]
+            row_values["Qty out / Ctn"] = tr["Qty Out / Ctn"]
+            row_values["Balance"] = tr["Balance"]
+            row_values["Ctn Balance"] = tr["Ctn Balance"]
+
+            for idx, h in enumerate(headers, start=1):
+                val = row_values[h]
+                if pd.isna(val):
+                    val = ""
+                c = sheet.cell(rowx, idx)
+                c.border = body_border
+                c.fill = fill
+                c.font = font
+                c.alignment = Alignment(vertical="center")
+                if h == "Activity Date" and not (is_begin or is_end) and val != "":
+                    c.value = pd.Timestamp(val).to_pydatetime()
+                    c.number_format = "mm/dd/yyyy"
+                elif h in ("Balance", "Ctn Balance") and val != "":
+                    c.value = float(val)
+                    c.number_format = "#,##0.####"
+                else:
+                    c.value = val
+
+            if is_end:
+                ending_balance = float(tr["Balance"])
+                ending_ctn = tr["Ctn Balance"]
             rowx += 1
 
-            tx_only = group[group["Type"].isin(["IN", "OUT"])].copy()
-            total_in = float(tx_only["Qty In"].sum()) if not tx_only.empty else 0.0
-            total_out = float(tx_only["Qty Out"].sum()) if not tx_only.empty else 0.0
-            total_in_ctn = sum(
-                abs(_pack_ctn(float(q), packed) or 0)
-                for q in tx_only.loc[tx_only["Qty In"] > 0, "Qty In"]
-            )
-            total_out_ctn = sum(
-                abs(_pack_ctn(float(q), packed) or 0)
-                for q in tx_only.loc[tx_only["Qty Out"] > 0, "Qty Out"]
-            )
+        total_in_text = "" if total_in == 0 else f"{total_in:,.0f} / {total_in_ctn:,}"
+        total_out_text = "" if total_out == 0 else f"{total_out:,.0f} / {total_out_ctn:,}"
+        total_values = {h: "" for h in headers}
+        total_values["Ref #"] = "Total"
+        total_values["Qty in / Ctn"] = total_in_text
+        total_values["Qty out / Ctn"] = total_out_text
+        total_values["Balance"] = ending_balance if ending_balance is not None else ""
+        total_values["Ctn Balance"] = ending_ctn if ending_ctn is not None else ""
 
-            ending_balance = None
-            ending_ctn = None
+        for idx, h in enumerate(headers, start=1):
+            val = total_values[h]
+            if pd.isna(val):
+                val = ""
+            c = sheet.cell(rowx, idx)
+            c.fill = total_fill
+            c.font = Font(bold=True, color=dark_text)
+            c.border = body_border
+            c.alignment = Alignment(vertical="center")
+            if h in ("Balance", "Ctn Balance") and val != "":
+                c.value = float(val)
+                c.number_format = "#,##0.####"
+            else:
+                c.value = val
+        rowx += 1
 
-            for _, tr in group.iterrows():
-                is_begin = tr["Type"] == "BEGINNING"
-                is_end = tr["Type"] == "ENDING"
-                base = begin_fmt if is_begin else end_fmt if is_end else tx_fmt
-                numbase = begin_fmt if is_begin else end_fmt if is_end else tx_num_fmt
-                datebase = begin_fmt if is_begin else end_fmt if is_end else tx_date_fmt
+    sheet.freeze_panes = "A6"
 
-                row_values = {h: "" for h in headers}
-                if is_begin:
-                    row_values["Activity Date"] = "Beginning Balance"
-                elif is_end:
-                    row_values["Activity Date"] = "Ending Balance"
-                else:
-                    row_values["Activity Date"] = tr["Activity Date"]
-                    row_values["Trans. #"] = tr["Trans. #"]
-                    row_values["Ref #"] = tr["Ref #"]
-                    for col in optional_present:
-                        row_values[col] = tr.get(col, "")
+    width_map = {
+        "SKU": 20, "Qualifier": 10, "Item Description": 38, "Packed": 10,
+        "Activity Date": 17, "Trans. #": 15, "Ref #": 22,
+        "Qty in / Ctn": 18, "Qty out / Ctn": 18,
+        "SubInventory": 14, "Locator": 14, "Balance": 14, "Ctn Balance": 13,
+    }
+    for idx, h in enumerate(headers, start=1):
+        sheet.column_dimensions[get_column_letter(idx)].width = width_map[h]
+    sheet.auto_filter.ref = f"A5:{last_letter}5"
 
-                row_values["Qty in / Ctn"] = tr["Qty In / Ctn"]
-                row_values["Qty out / Ctn"] = tr["Qty Out / Ctn"]
-                row_values["Balance"] = tr["Balance"]
-                row_values["Ctn Balance"] = tr["Ctn Balance"]
-
-                for c, h in enumerate(headers):
-                    val = row_values[h]
-                    if h == "Activity Date" and not (is_begin or is_end) and pd.notna(val):
-                        sheet.write_datetime(rowx, c, pd.Timestamp(val).to_pydatetime(), datebase)
-                    elif h in ("Balance", "Ctn Balance") and val is not None and val != "" and not pd.isna(val):
-                        sheet.write_number(rowx, c, float(val), numbase)
-                    else:
-                        sheet.write(rowx, c, "" if pd.isna(val) else val, base)
-
-                if is_end:
-                    ending_balance = float(tr["Balance"])
-                    ending_ctn = tr["Ctn Balance"]
-                rowx += 1
-
-            total_in_text = "" if total_in == 0 else f"{total_in:,.0f} / {total_in_ctn:,}"
-            total_out_text = "" if total_out == 0 else f"{total_out:,.0f} / {total_out_ctn:,}"
-            total_values = {h: "" for h in headers}
-            total_values["Ref #"] = "Total"
-            total_values["Qty in / Ctn"] = total_in_text
-            total_values["Qty out / Ctn"] = total_out_text
-            total_values["Balance"] = ending_balance if ending_balance is not None else ""
-            total_values["Ctn Balance"] = ending_ctn if ending_ctn is not None else ""
-
-            for c, h in enumerate(headers):
-                val = total_values[h]
-                if h in ("Balance", "Ctn Balance") and val is not None and val != "" and not pd.isna(val):
-                    sheet.write_number(rowx, c, float(val), total_fmt)
-                else:
-                    sheet.write(rowx, c, "" if pd.isna(val) else val, total_fmt)
-            rowx += 1
-
-                                                                    
-        sheet.freeze_panes(5, 0)
-
-        width_map = {
-            "SKU": 20, "Qualifier": 10, "Item Description": 38, "Packed": 10,
-            "Activity Date": 17, "Trans. #": 15, "Ref #": 22,
-            "Qty in / Ctn": 18, "Qty out / Ctn": 18,
-            "SubInventory": 14, "Locator": 14, "Balance": 14, "Ctn Balance": 13,
-        }
-        for i, h in enumerate(headers):
-            sheet.set_column(i, i, width_map[h])
-        sheet.autofilter(4, 0, 4, last_col)
-
+    wb.save(output)
     output.seek(0)
     return output.getvalue()
 
