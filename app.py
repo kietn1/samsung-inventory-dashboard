@@ -1,7 +1,12 @@
 import hashlib
 import html
+import io
 import json
+import math
 import re
+from dataclasses import dataclass
+from datetime import timezone
+from zoneinfo import ZoneInfo
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
@@ -3963,6 +3968,769 @@ def reset_transaction_filters(search_key, mode_key, date_key, range_key):
     )
 
 
+WAREHOUSE_TZ = ZoneInfo("America/New_York")
+MIGRATION_PREFIX = "MIGRATION_"
+
+REQUIRED = {
+    "inbound": {"Inb. No.", "Ref. No.", "Item Code", "Inb. Expected Qty.", "Inb. Complete Qty."},
+    "outbound": {"DO No.", "Outb. No.", "Item Code", "Outb. Complete Qty.", "Outb. Status"},
+    "inventory": {"Item Code", "Tot. Qty.", "Available Qty."},
+    "master": {"Item Code", "Item Nm", "Qty./Carton"},
+}
+
+
+@dataclass
+class ReportBundle:
+    reconciliation: pd.DataFrame
+    activity: pd.DataFrame
+    open_orders: pd.DataFrame
+    migration_ref: str
+    migration_datetime: pd.Timestamp
+    snapshot_datetime: datetime
+    warnings: list[str]
+    stats: dict
+
+
+def _read_excel(uploaded, required_cols: set[str]) -> pd.DataFrame:
+    uploaded.seek(0)
+    try:
+        raw = pd.read_excel(uploaded, header=None, dtype=object, engine="calamine")
+        engine = "calamine"
+    except Exception:
+        uploaded.seek(0)
+        raw = pd.read_excel(uploaded, header=None, dtype=object)
+        engine = None
+
+    header_row = None
+    for idx in range(min(20, len(raw))):
+        values = {str(v).strip() for v in raw.iloc[idx].tolist() if pd.notna(v)}
+        if required_cols.issubset(values):
+            header_row = idx
+            break
+    if header_row is None:
+        missing_hint = ", ".join(sorted(required_cols))
+        raise ValueError(f"Could not find the expected WMS header. Required columns include: {missing_hint}")
+
+    uploaded.seek(0)
+    kwargs = dict(header=header_row, dtype=object)
+    if engine:
+        kwargs["engine"] = engine
+    df = pd.read_excel(uploaded, **kwargs)
+    df = df.dropna(how="all")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def _num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+
+def _dt_series(s: pd.Series) -> pd.Series:
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    if s is None:
+        return out
+
+    numeric = pd.to_numeric(s, errors="coerce")
+    excel_mask = numeric.between(20000, 80000, inclusive="both")
+    if excel_mask.any():
+        out.loc[excel_mask] = pd.Timestamp("1899-12-30") + pd.to_timedelta(numeric.loc[excel_mask], unit="D")
+
+    other_mask = ~excel_mask & s.notna()
+    if other_mask.any():
+        parsed = pd.to_datetime(s.loc[other_mask], errors="coerce")
+        try:
+            parsed = parsed.dt.tz_localize(None)
+        except (TypeError, AttributeError):
+            pass
+        out.loc[other_mask] = parsed
+    return out
+
+
+def _first_existing(df: pd.DataFrame, candidates: list[str], default="") -> pd.Series:
+    out = pd.Series(default, index=df.index, dtype=object)
+    for col in candidates:
+        if col not in df.columns:
+            continue
+        vals = df[col]
+        mask = out.astype(str).str.strip().eq("") & vals.notna() & vals.astype(str).str.strip().ne("")
+        out.loc[mask] = vals.loc[mask]
+    return out
+
+
+def _coalesce_dates(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    out = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    for col in candidates:
+        if col not in df.columns:
+            continue
+        vals = _dt_series(df[col])
+        out = out.fillna(vals)
+    return out
+
+
+def _snapshot_from_filename(name: str) -> datetime:
+    matches = re.findall(r"(?<!\d)(1\d{12})(?!\d)", name or "")
+    if matches:
+        return datetime.fromtimestamp(int(matches[-1]) / 1000, tz=timezone.utc).astimezone(WAREHOUSE_TZ)
+    return datetime.now(WAREHOUSE_TZ)
+
+
+def _clean_sku(s: pd.Series) -> pd.Series:
+    return s.fillna("").astype(str).str.strip().str.upper()
+
+
+def _pack_ctn(qty: float, packed: float) -> int | None:
+    if not packed or packed <= 0:
+        return None
+    if qty == 0:
+        return 0
+    return int(math.copysign(math.ceil(abs(qty) / packed), qty))
+
+
+def _qty_ctn_text(qty: float, packed: float) -> str:
+    if abs(qty) < 1e-12:
+        return ""
+    ctn = _pack_ctn(qty, packed)
+    if ctn is None:
+        return f"{qty:,.4f}"
+    return f"{qty:,.4f} / {ctn:,}"
+
+
+def _choose_migration(inb: pd.DataFrame) -> tuple[str, pd.Timestamp]:
+    refs = inb["Ref. No."].fillna("").astype(str).str.strip()
+    mig = inb[refs.str.upper().str.startswith(MIGRATION_PREFIX)].copy()
+    if mig.empty:
+        raise ValueError("No MIGRATION_* rows were found in the Inbound Tracking file.")
+
+    mig["_activity_dt"] = _coalesce_dates(mig, ["Progress Date", "Received Date", "Closing Datetime", "Inb. Expected Date"])
+    grouped = mig.groupby("Ref. No.", dropna=False)["_activity_dt"].max().reset_index()
+    if grouped["_activity_dt"].notna().any():
+        row = grouped.sort_values("_activity_dt", na_position="first").iloc[-1]
+        ref = str(row["Ref. No."])
+        dt = row["_activity_dt"]
+    else:
+        ref = str(mig["Ref. No."].iloc[-1])
+        digits = re.search(r"(\d{6})", ref)
+        dt = pd.NaT
+        if digits:
+            try:
+                dt = pd.Timestamp(datetime.strptime(digits.group(1), "%m%d%y"))
+            except ValueError:
+                pass
+    if pd.isna(dt):
+        raise ValueError(f"Migration {ref} was found, but its date could not be determined.")
+    return ref, pd.Timestamp(dt)
+
+
+def build_report(inbound_file, outbound_file, inventory_file, master_file) -> ReportBundle:
+    inb = _read_excel(inbound_file, REQUIRED["inbound"])
+    outb = _read_excel(outbound_file, REQUIRED["outbound"])
+    inv = _read_excel(inventory_file, REQUIRED["inventory"])
+    master = _read_excel(master_file, REQUIRED["master"])
+
+    for df in (inb, outb, inv, master):
+        if "Item Code" in df.columns:
+            df["Item Code"] = _clean_sku(df["Item Code"])
+            df.drop(df[df["Item Code"].eq("")].index, inplace=True)
+
+    migration_ref, migration_dt = _choose_migration(inb)
+    snapshot_dt = _snapshot_from_filename(getattr(inventory_file, "name", ""))
+    snapshot_naive = pd.Timestamp(snapshot_dt.replace(tzinfo=None))
+    warnings: list[str] = []
+
+                 
+    master["Packed"] = _num(master["Qty./Carton"])
+    master_info = (
+        master.groupby("Item Code", as_index=False)
+        .agg({"Item Nm": "first", "Packed": "max"})
+        .rename(columns={"Item Nm": "Master Description"})
+    )
+
+                                           
+    mig_mask = inb["Ref. No."].fillna("").astype(str).str.strip().eq(migration_ref)
+    migration = inb[mig_mask].copy()
+    migration["Opening Qty"] = _num(migration["Inb. Expected Qty."])
+    opening = migration.groupby("Item Code", as_index=False)["Opening Qty"].sum()
+
+                                                      
+    normal_in = inb[~mig_mask].copy()
+    normal_in["Qty In"] = _num(normal_in["Inb. Complete Qty."])
+    normal_in["Activity Date"] = _coalesce_dates(normal_in, ["Closing Datetime", "Received Date", "Progress Date", "Inb. Expected Date"])
+    status_text = (
+        normal_in.get("Inb. Status", "").fillna("").astype(str)
+        + " "
+        + normal_in.get("Inb. Detail Status", "").fillna("").astype(str)
+    )
+    valid_in = normal_in[
+        (normal_in["Qty In"] > 0)
+        & ~status_text.str.contains(r"cancel|void", case=False, regex=True)
+        & normal_in["Activity Date"].notna()
+        & (normal_in["Activity Date"] >= migration_dt)
+        & (normal_in["Activity Date"] <= snapshot_naive)
+    ].copy()
+    valid_in["Type"] = "IN"
+    valid_in["Trans. #"] = valid_in["Inb. No."].fillna("").astype(str)
+    valid_in["Ref #"] = _first_existing(valid_in, ["Ref. No.", "PO No."])
+    valid_in["Qty Out"] = 0.0
+    valid_in["_seq"] = range(len(valid_in))
+    for optional_col in ["Qualifier", "SubInventory", "Locator"]:
+        if optional_col not in valid_in.columns:
+            valid_in[optional_col] = ""
+
+                        
+    outb["Qty Out"] = _num(outb["Outb. Complete Qty."])
+    outb["Activity Date"] = _coalesce_dates(outb, ["Outb. Complete Datetime"])
+    status = outb["Outb. Status"].fillna("").astype(str).str.strip()
+    unexpected = outb[(outb["Qty Out"] > 0) & ~status.str.casefold().eq("all shipped")]
+    if not unexpected.empty:
+        warnings.append(
+            f"{len(unexpected):,} outbound row(s) have Complete Qty > 0 but status is not 'All Shipped'. "
+            "They are excluded from Item Activity and should be reviewed."
+        )
+    valid_out = outb[
+        status.str.casefold().eq("all shipped")
+        & (outb["Qty Out"] > 0)
+        & outb["Activity Date"].notna()
+        & (outb["Activity Date"] >= migration_dt)
+        & (outb["Activity Date"] <= snapshot_naive)
+    ].copy()
+    valid_out["Type"] = "OUT"
+    valid_out["Trans. #"] = valid_out["Outb. No."].fillna("").astype(str)
+    valid_out["Ref #"] = valid_out["DO No."].fillna("").astype(str)
+    valid_out["Qty In"] = 0.0
+    valid_out["_seq"] = range(len(valid_out))
+    for optional_col in ["Qualifier", "SubInventory", "Locator"]:
+        if optional_col not in valid_out.columns:
+            valid_out[optional_col] = ""
+
+                                                                      
+    outb["Expected Qty"] = _num(outb["Outb. Expect Qty."])
+    outb["Complete Qty"] = _num(outb["Outb. Complete Qty."])
+    outb["Picking Qty"] = _num(outb["Picking Qty."]) if "Picking Qty." in outb.columns else 0.0
+    outb["Remaining Qty"] = (outb["Expected Qty"] - outb["Complete Qty"]).clip(lower=0)
+    open_orders = outb[(outb["Remaining Qty"] > 0) & ~status.str.casefold().eq("all shipped")].copy()
+    open_orders["Expect Date"] = _coalesce_dates(open_orders, ["Expect Date", "Req. Dlvry. Date"])
+
+                       
+    inv["Inventory"] = _num(inv["Tot. Qty."])
+    inv["Available"] = _num(inv["Available Qty."])
+    inv_summary = inv.groupby("Item Code", as_index=False).agg(
+        Inventory=("Inventory", "sum"),
+        Available=("Available", "sum"),
+        **{"Inventory Description": ("Item Nm", "first")},
+    )
+
+                      
+    in_sum = valid_in.groupby("Item Code", as_index=False)["Qty In"].sum()
+    out_sum = valid_out.groupby("Item Code", as_index=False)["Qty Out"].sum()
+
+    all_skus = sorted(
+        set(opening["Item Code"])
+        | set(inv_summary["Item Code"])
+        | set(valid_in["Item Code"])
+        | set(valid_out["Item Code"])
+    )
+    recon = pd.DataFrame({"SKU": all_skus})
+    for frame, left, right in [
+        (opening, "SKU", "Item Code"),
+        (in_sum, "SKU", "Item Code"),
+        (out_sum, "SKU", "Item Code"),
+        (inv_summary, "SKU", "Item Code"),
+        (master_info, "SKU", "Item Code"),
+    ]:
+        recon = recon.merge(frame, left_on=left, right_on=right, how="left").drop(columns=[right])
+
+    for col in ["Opening Qty", "Qty In", "Qty Out", "Inventory", "Available", "Packed"]:
+        if col not in recon.columns:
+            recon[col] = 0.0
+        recon[col] = pd.to_numeric(recon[col], errors="coerce").fillna(0.0)
+
+    recon["Description"] = recon.get("Master Description", pd.Series(index=recon.index, dtype=object))
+    if "Inventory Description" in recon.columns:
+        recon["Description"] = recon["Description"].fillna(recon["Inventory Description"])
+    recon["Description"] = recon["Description"].fillna("")
+    recon["Calculated Ending"] = recon["Opening Qty"] + recon["Qty In"] - recon["Qty Out"]
+    recon["Variance"] = recon["Calculated Ending"] - recon["Inventory"]
+    recon["Status"] = recon["Variance"].abs().le(1e-9).map({True: "MATCH", False: "CHECK"})
+    recon["Reserved / Unavailable"] = recon["Inventory"] - recon["Available"]
+    recon = recon.rename(columns={
+        "Opening Qty": "Beginning",
+        "Qty In": "Inbound",
+        "Qty Out": "Outbound",
+    })
+    recon = recon[[
+        "SKU", "Description", "Packed", "Beginning", "Inbound", "Outbound",
+        "Calculated Ending", "Inventory", "Available", "Reserved / Unavailable", "Variance", "Status"
+    ]].sort_values(["Status", "SKU"], ascending=[True, True]).reset_index(drop=True)
+
+                                                          
+    activity_source_cols = [
+        "Item Code", "Activity Date", "Type", "Trans. #", "Ref #",
+        "Qty In", "Qty Out", "Qualifier", "SubInventory", "Locator", "_seq"
+    ]
+    in_act = valid_in[activity_source_cols].copy()
+    out_act = valid_out[activity_source_cols].copy()
+    tx = pd.concat([in_act, out_act], ignore_index=True)
+    type_order = tx["Type"].map({"IN": 0, "OUT": 1}).fillna(9)
+    tx["_type_order"] = type_order
+    tx = tx.sort_values(["Item Code", "Activity Date", "_type_order", "_seq"]).reset_index(drop=True)
+
+    detail_rows = []
+    recon_idx = recon.set_index("SKU")
+    grouped_tx = {sku: grp for sku, grp in tx.groupby("Item Code")}
+    for sku in recon["SKU"]:
+        rr = recon_idx.loc[sku]
+        balance = float(rr["Beginning"])
+        packed = float(rr["Packed"])
+        desc = rr["Description"]
+        detail_rows.append({
+            "SKU": sku, "Description": desc, "Packed": packed, "Activity Date": pd.NaT,
+            "Type": "BEGINNING", "Trans. #": "", "Ref #": migration_ref,
+            "Qty In": 0.0, "Qty Out": 0.0, "Qty In / Ctn": "", "Qty Out / Ctn": "",
+            "Balance": balance, "Ctn Balance": _pack_ctn(balance, packed),
+            "Qualifier": "", "SubInventory": "", "Locator": "",
+        })
+        if sku in grouped_tx:
+            for _, tr in grouped_tx[sku].iterrows():
+                qin = float(tr["Qty In"])
+                qout = float(tr["Qty Out"])
+                balance += qin - qout
+                detail_rows.append({
+                    "SKU": sku, "Description": desc, "Packed": packed,
+                    "Activity Date": tr["Activity Date"], "Type": tr["Type"],
+                    "Trans. #": tr["Trans. #"], "Ref #": tr["Ref #"],
+                    "Qty In": qin, "Qty Out": qout,
+                    "Qty In / Ctn": _qty_ctn_text(qin, packed),
+                    "Qty Out / Ctn": _qty_ctn_text(qout, packed),
+                    "Balance": balance, "Ctn Balance": _pack_ctn(balance, packed),
+                    "Qualifier": tr.get("Qualifier", ""),
+                    "SubInventory": tr.get("SubInventory", ""),
+                    "Locator": tr.get("Locator", ""),
+                })
+        detail_rows.append({
+            "SKU": sku, "Description": desc, "Packed": packed, "Activity Date": pd.NaT,
+            "Type": "ENDING", "Trans. #": "", "Ref #": "CURRENT INVENTORY",
+            "Qty In": 0.0, "Qty Out": 0.0, "Qty In / Ctn": "", "Qty Out / Ctn": "",
+            "Balance": balance, "Ctn Balance": _pack_ctn(balance, packed),
+            "Qualifier": "", "SubInventory": "", "Locator": "",
+        })
+    activity = pd.DataFrame(detail_rows)
+
+                        
+    if not open_orders.empty:
+        open_orders = open_orders.merge(master_info, on="Item Code", how="left")
+        open_orders = open_orders.merge(
+            inv_summary[["Item Code", "Inventory", "Available"]], on="Item Code", how="left"
+        )
+        open_orders["Description"] = open_orders["Master Description"].fillna(open_orders.get("Item Nm", ""))
+        open_orders = open_orders[[
+            "DO No.", "Item Code", "Description", "Outb. Status", "Expected Qty",
+            "Picking Qty", "Complete Qty", "Remaining Qty", "Expect Date", "Inventory", "Available"
+        ]].rename(columns={"Item Code": "SKU", "Outb. Status": "Status"})
+        open_orders = open_orders.sort_values(["DO No.", "SKU"]).reset_index(drop=True)
+    else:
+        open_orders = pd.DataFrame(columns=[
+            "DO No.", "SKU", "Description", "Status", "Expected Qty", "Picking Qty",
+            "Complete Qty", "Remaining Qty", "Expect Date", "Inventory", "Available"
+        ])
+
+    mismatch_count = int((recon["Status"] == "CHECK").sum())
+    negative_begin = int((recon["Beginning"] < 0).sum())
+    stats = {
+        "sku_count": int(len(recon)),
+        "current_inventory": float(recon["Inventory"].sum()),
+        "total_inbound": float(recon["Inbound"].sum()),
+        "total_outbound": float(recon["Outbound"].sum()),
+        "matched": int((recon["Status"] == "MATCH").sum()),
+        "mismatched": mismatch_count,
+        "negative_beginning": negative_begin,
+        "opening_total": float(recon["Beginning"].sum()),
+    }
+    if mismatch_count:
+        warnings.append(f"{mismatch_count:,} SKU(s) do not reconcile to Inventory Tot. Qty.")
+    if negative_begin:
+        warnings.append(f"{negative_begin:,} SKU(s) have a negative Beginning Balance.")
+
+    return ReportBundle(
+        reconciliation=recon,
+        activity=activity,
+        open_orders=open_orders,
+        migration_ref=migration_ref,
+        migration_datetime=migration_dt,
+        snapshot_datetime=snapshot_dt,
+        warnings=warnings,
+        stats=stats,
+    )
+
+
+def _fmt_qty(v):
+    if pd.isna(v):
+        return ""
+    v = float(v)
+    return f"{v:,.0f}" if abs(v - round(v)) < 1e-9 else f"{v:,.4f}"
+
+
+def export_excel(bundle: ReportBundle) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="mm/dd/yyyy") as writer:
+        wb = writer.book
+
+        navy = "#17365D"
+        blue = "#1F4E78"
+        light_blue = "#D9EAF7"
+        very_light_blue = "#F4F8FC"
+        light_gray = "#F3F6F8"
+        green = "#E2F0D9"
+        white = "#FFFFFF"
+        border = "#D9E1F2"
+        dark_text = "#243447"
+
+        title_fmt = wb.add_format({
+            "bold": True, "font_size": 18, "font_color": white,
+            "bg_color": navy, "align": "left", "valign": "vcenter"
+        })
+        subtitle_fmt = wb.add_format({
+            "font_size": 10, "font_color": "#44546A",
+            "bg_color": "#EAF2F8", "valign": "vcenter"
+        })
+        header_fmt = wb.add_format({
+            "bold": True, "font_color": white, "bg_color": blue,
+            "border": 1, "border_color": white,
+            "align": "center", "valign": "vcenter", "text_wrap": True
+        })
+        item_fmt = wb.add_format({
+            "bold": True, "font_color": dark_text, "bg_color": light_blue,
+            "top": 1, "bottom": 1, "border_color": border, "valign": "vcenter"
+        })
+        item_num_fmt = wb.add_format({
+            "bold": True, "font_color": dark_text, "bg_color": light_blue,
+            "top": 1, "bottom": 1, "border_color": border,
+            "num_format": "#,##0.####", "valign": "vcenter"
+        })
+        begin_fmt = wb.add_format({
+            "bold": True, "bg_color": very_light_blue,
+            "border": 1, "border_color": border, "font_color": dark_text
+        })
+        end_fmt = wb.add_format({
+            "bold": True, "bg_color": green,
+            "border": 1, "border_color": border, "font_color": "#375623"
+        })
+        total_fmt = wb.add_format({
+            "bold": True, "bg_color": light_gray,
+            "border": 1, "border_color": border, "font_color": dark_text
+        })
+        tx_fmt = wb.add_format({"border": 1, "border_color": border})
+        tx_date_fmt = wb.add_format({
+            "border": 1, "border_color": border, "num_format": "mm/dd/yyyy"
+        })
+        tx_num_fmt = wb.add_format({
+            "border": 1, "border_color": border, "num_format": "#,##0.####"
+        })
+
+        optional_order = ["Qualifier", "SubInventory", "Locator"]
+        optional_present = []
+        for col in optional_order:
+            if col in bundle.activity.columns:
+                values = bundle.activity[col].fillna("").astype(str).str.strip()
+                if values.ne("").any():
+                    optional_present.append(col)
+
+                                                                                  
+        headers = ["SKU"]
+        if "Qualifier" in optional_present:
+            headers.append("Qualifier")
+        headers += [
+            "Item Description", "Packed", "Activity Date", "Trans. #", "Ref #",
+            "Qty in / Ctn", "Qty out / Ctn"
+        ]
+        if "SubInventory" in optional_present:
+            headers.append("SubInventory")
+        if "Locator" in optional_present:
+            headers.append("Locator")
+        headers += ["Balance", "Ctn Balance"]
+
+        col_index = {name: idx for idx, name in enumerate(headers)}
+        last_col = len(headers) - 1
+
+        sheet = wb.add_worksheet("ITEM ACTIVITY")
+        writer.sheets["ITEM ACTIVITY"] = sheet
+        sheet.hide_gridlines(2)
+        sheet.set_landscape()
+        sheet.fit_to_pages(1, 0)
+        sheet.repeat_rows(0, 4)
+        sheet.set_margins(left=0.25, right=0.25, top=0.5, bottom=0.5)
+
+        sheet.set_row(0, 28)
+        sheet.merge_range(0, 0, 0, last_col, "ORLANDO ITEM ACTIVITY REPORT", title_fmt)
+        sheet.merge_range(1, 0, 1, last_col, "Warehouse: Orlando", subtitle_fmt)
+        sheet.merge_range(
+            2, 0, 2, last_col,
+            f"Activity From: {bundle.migration_datetime:%m/%d/%Y}   |   "
+            f"Through: {bundle.snapshot_datetime:%m/%d/%Y}   |   "
+            f"Opening Reference: {bundle.migration_ref}",
+            subtitle_fmt,
+        )
+
+        for c, h in enumerate(headers):
+            sheet.write(4, c, h, header_fmt)
+        sheet.set_row(4, 32)
+
+        rowx = 5
+        for sku, group in bundle.activity.groupby("SKU", sort=False):
+            first = group.iloc[0]
+            packed = float(first["Packed"]) if pd.notna(first["Packed"]) else 0.0
+
+            for c in range(len(headers)):
+                sheet.write_blank(rowx, c, None, item_fmt)
+            sheet.write(rowx, col_index["SKU"], sku, item_fmt)
+            sheet.write(rowx, col_index["Item Description"], first["Description"], item_fmt)
+            sheet.write_number(rowx, col_index["Packed"], packed, item_num_fmt)
+            rowx += 1
+
+            tx_only = group[group["Type"].isin(["IN", "OUT"])].copy()
+            total_in = float(tx_only["Qty In"].sum()) if not tx_only.empty else 0.0
+            total_out = float(tx_only["Qty Out"].sum()) if not tx_only.empty else 0.0
+            total_in_ctn = sum(
+                abs(_pack_ctn(float(q), packed) or 0)
+                for q in tx_only.loc[tx_only["Qty In"] > 0, "Qty In"]
+            )
+            total_out_ctn = sum(
+                abs(_pack_ctn(float(q), packed) or 0)
+                for q in tx_only.loc[tx_only["Qty Out"] > 0, "Qty Out"]
+            )
+
+            ending_balance = None
+            ending_ctn = None
+
+            for _, tr in group.iterrows():
+                is_begin = tr["Type"] == "BEGINNING"
+                is_end = tr["Type"] == "ENDING"
+                base = begin_fmt if is_begin else end_fmt if is_end else tx_fmt
+                numbase = begin_fmt if is_begin else end_fmt if is_end else tx_num_fmt
+                datebase = begin_fmt if is_begin else end_fmt if is_end else tx_date_fmt
+
+                row_values = {h: "" for h in headers}
+                if is_begin:
+                    row_values["Activity Date"] = "Beginning Balance"
+                elif is_end:
+                    row_values["Activity Date"] = "Ending Balance"
+                else:
+                    row_values["Activity Date"] = tr["Activity Date"]
+                    row_values["Trans. #"] = tr["Trans. #"]
+                    row_values["Ref #"] = tr["Ref #"]
+                    for col in optional_present:
+                        row_values[col] = tr.get(col, "")
+
+                row_values["Qty in / Ctn"] = tr["Qty In / Ctn"]
+                row_values["Qty out / Ctn"] = tr["Qty Out / Ctn"]
+                row_values["Balance"] = tr["Balance"]
+                row_values["Ctn Balance"] = tr["Ctn Balance"]
+
+                for c, h in enumerate(headers):
+                    val = row_values[h]
+                    if h == "Activity Date" and not (is_begin or is_end) and pd.notna(val):
+                        sheet.write_datetime(rowx, c, pd.Timestamp(val).to_pydatetime(), datebase)
+                    elif h in ("Balance", "Ctn Balance") and val is not None and val != "" and not pd.isna(val):
+                        sheet.write_number(rowx, c, float(val), numbase)
+                    else:
+                        sheet.write(rowx, c, "" if pd.isna(val) else val, base)
+
+                if is_end:
+                    ending_balance = float(tr["Balance"])
+                    ending_ctn = tr["Ctn Balance"]
+                rowx += 1
+
+            total_in_text = "" if total_in == 0 else f"{total_in:,.0f} / {total_in_ctn:,}"
+            total_out_text = "" if total_out == 0 else f"{total_out:,.0f} / {total_out_ctn:,}"
+            total_values = {h: "" for h in headers}
+            total_values["Ref #"] = "Total"
+            total_values["Qty in / Ctn"] = total_in_text
+            total_values["Qty out / Ctn"] = total_out_text
+            total_values["Balance"] = ending_balance if ending_balance is not None else ""
+            total_values["Ctn Balance"] = ending_ctn if ending_ctn is not None else ""
+
+            for c, h in enumerate(headers):
+                val = total_values[h]
+                if h in ("Balance", "Ctn Balance") and val is not None and val != "" and not pd.isna(val):
+                    sheet.write_number(rowx, c, float(val), total_fmt)
+                else:
+                    sheet.write(rowx, c, "" if pd.isna(val) else val, total_fmt)
+            rowx += 1
+
+                                                                    
+        sheet.freeze_panes(5, 0)
+
+        width_map = {
+            "SKU": 20, "Qualifier": 10, "Item Description": 38, "Packed": 10,
+            "Activity Date": 17, "Trans. #": 15, "Ref #": 22,
+            "Qty in / Ctn": 18, "Qty out / Ctn": 18,
+            "SubInventory": 14, "Locator": 14, "Balance": 14, "Ctn Balance": 13,
+        }
+        for i, h in enumerate(headers):
+            sheet.set_column(i, i, width_map[h])
+        sheet.autofilter(4, 0, 4, last_col)
+
+    output.seek(0)
+    return output.getvalue()
+
+def render_orlando_item_activity():
+    st.sidebar.markdown('<div class="sidebar-section-title">Item Activity files</div>', unsafe_allow_html=True)
+    st.sidebar.markdown('<div class="sidebar-section-help">Upload all four Orlando WMS exports.</div>', unsafe_allow_html=True)
+    inbound = st.sidebar.file_uploader("Inbound Tracking", type=["xlsx", "xls"], key="orlando_ia_inbound")
+    outbound = st.sidebar.file_uploader("Outbound Tracking", type=["xlsx", "xls"], key="orlando_ia_outbound")
+    inventory = st.sidebar.file_uploader("Inventory", type=["xlsx", "xls"], key="orlando_ia_inventory")
+    master = st.sidebar.file_uploader("Item Master", type=["xlsx", "xls"], key="orlando_ia_master")
+    generate = st.sidebar.button("Generate Item Activity", type="primary", use_container_width=True, key="orlando_ia_generate")
+
+    if generate:
+        if not all([inbound, outbound, inventory, master]):
+            st.session_state.pop("orlando_ia_bundle", None)
+            st.session_state.pop("orlando_ia_excel", None)
+            st.error("Upload all 4 WMS files first.")
+        else:
+            try:
+                with st.spinner("Building Orlando Item Activity report..."):
+                    bundle = build_report(inbound, outbound, inventory, master)
+                    excel = export_excel(bundle)
+                    st.session_state["orlando_ia_bundle"] = bundle
+                    st.session_state["orlando_ia_excel"] = excel
+            except Exception as exc:
+                st.session_state.pop("orlando_ia_bundle", None)
+                st.session_state.pop("orlando_ia_excel", None)
+                st.exception(exc)
+
+    bundle = st.session_state.get("orlando_ia_bundle")
+    if bundle is None:
+        st.markdown(
+            """
+            <div class="app-header">
+                <div class="app-header-main">
+                    <div class="app-title-cluster">
+                        <div class="fluent-grid-icon app-product-icon" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+                        <div class="app-title-copy">
+                            <div class="app-eyebrow">Orlando warehouse</div>
+                            <div class="app-title">Item Activity Report</div>
+                        </div>
+                    </div>
+                    <div class="app-subtitle">Detailed WMS item movements with migration opening balance and running balance.</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.info("Upload Inbound Tracking, Outbound Tracking, Inventory, and Item Master, then click Generate Item Activity.")
+        return
+
+    for warning in bundle.warnings:
+        st.warning(warning)
+
+    st.markdown(
+        f"""
+        <div class="app-header">
+            <div class="app-header-main">
+                <div class="app-title-cluster">
+                    <div class="fluent-grid-icon app-product-icon" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+                    <div class="app-title-copy">
+                        <div class="app-eyebrow">Orlando warehouse</div>
+                        <div class="app-title">Item Activity Report</div>
+                    </div>
+                </div>
+                <div class="app-subtitle">Detailed WMS item movements with migration opening balance and running balance.</div>
+            </div>
+            <div class="app-meta">
+                <span class="meta-chip meta-chip-date meta-chip-accent">{bundle.migration_datetime:%m/%d/%Y} – {bundle.snapshot_datetime:%m/%d/%Y}</span>
+                <span class="meta-chip meta-chip-status">{bundle.migration_ref}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    stats = bundle.stats
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        metric_card("SKUs", f"{stats['sku_count']:,}", "Items in activity scope")
+    with c2:
+        metric_card("Inventory", _fmt_qty(stats["current_inventory"]), "Current WMS Tot. Qty.")
+    with c3:
+        metric_card("Inbound", _fmt_qty(stats["total_inbound"]), "Completed after migration")
+    with c4:
+        metric_card("Outbound", _fmt_qty(stats["total_outbound"]), "All Shipped completed qty")
+    with c5:
+        metric_card("Matched", f"{stats['matched']:,} / {stats['sku_count']:,}", "Calculated ending vs inventory")
+
+    excel_data = st.session_state.get("orlando_ia_excel")
+    if excel_data:
+        st.download_button(
+            "Download Item Activity Excel",
+            data=excel_data,
+            file_name=f"Orlando_Item_Activity_Report_{bundle.snapshot_datetime:%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            key="orlando_ia_download",
+        )
+
+    tab_recon, tab_activity, tab_open = st.tabs(["Reconciliation", "Item Activity", "Open Orders"])
+
+    with tab_recon:
+        left, right = st.columns([2, 1])
+        search = left.text_input("Search SKU / description", placeholder="Search SKU...", key="orlando_ia_recon_search")
+        status_filter = right.selectbox("Status", ["All", "MATCH", "CHECK"], key="orlando_ia_status_filter")
+        view = bundle.reconciliation.copy()
+        view = view[[
+            "SKU", "Description", "Status", "Calculated Ending", "Inventory", "Variance",
+            "Beginning", "Inbound", "Outbound", "Available", "Reserved / Unavailable", "Packed"
+        ]]
+        if search:
+            mask = view["SKU"].astype(str).str.contains(search, case=False, na=False) | view["Description"].astype(str).str.contains(search, case=False, na=False)
+            view = view[mask]
+        if status_filter != "All":
+            view = view[view["Status"] == status_filter]
+        st.dataframe(
+            view,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Packed": st.column_config.NumberColumn(format="%.0f"),
+                "Beginning": st.column_config.NumberColumn(format="%,.0f"),
+                "Inbound": st.column_config.NumberColumn(format="%,.0f"),
+                "Outbound": st.column_config.NumberColumn(format="%,.0f"),
+                "Calculated Ending": st.column_config.NumberColumn(format="%,.0f"),
+                "Inventory": st.column_config.NumberColumn(format="%,.0f"),
+                "Available": st.column_config.NumberColumn(format="%,.0f"),
+                "Reserved / Unavailable": st.column_config.NumberColumn(format="%,.0f"),
+                "Variance": st.column_config.NumberColumn(format="%,.0f"),
+            },
+        )
+
+    with tab_activity:
+        skus = bundle.reconciliation["SKU"].tolist()
+        selected = st.selectbox("Search / Select SKU", skus, key="orlando_ia_selected_sku")
+        row = bundle.reconciliation.set_index("SKU").loc[selected]
+        a, b, c, d = st.columns(4)
+        a.metric("Beginning", _fmt_qty(row["Beginning"]))
+        b.metric("Inbound", _fmt_qty(row["Inbound"]))
+        c.metric("Outbound", _fmt_qty(row["Outbound"]))
+        d.metric("Ending", _fmt_qty(row["Calculated Ending"]))
+        st.markdown(f"**{selected}** — {row['Description']} · Packed: {_fmt_qty(row['Packed'])}")
+        detail = bundle.activity[bundle.activity["SKU"] == selected].copy()
+        detail["Activity Date Display"] = detail.apply(
+            lambda r: "Beginning Balance" if r["Type"] == "BEGINNING" else "Ending Balance" if r["Type"] == "ENDING" else pd.Timestamp(r["Activity Date"]).strftime("%m/%d/%Y") if pd.notna(r["Activity Date"]) else "",
+            axis=1,
+        )
+        detail_cols = ["Activity Date Display", "Trans. #", "Ref #", "Qty In / Ctn", "Qty Out / Ctn"]
+        if "Qualifier" in detail.columns and detail["Qualifier"].fillna("").astype(str).str.strip().ne("").any():
+            detail_cols.insert(1, "Qualifier")
+        for optional_col in ["SubInventory", "Locator"]:
+            if optional_col in detail.columns and detail[optional_col].fillna("").astype(str).str.strip().ne("").any():
+                detail_cols.append(optional_col)
+        detail_cols += ["Balance", "Ctn Balance"]
+        detail = detail[detail_cols].rename(columns={"Activity Date Display": "Activity Date"})
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+
+    with tab_open:
+        st.caption("Open or not fully shipped rows are informational only and do not affect the Item Activity running balance.")
+        st.dataframe(bundle.open_orders, use_container_width=True, hide_index=True)
+
 restore_persistent_app_state()
 st.sidebar.markdown(
     """
@@ -3987,6 +4755,15 @@ update_persistent_app_state(values={"report_format": format_name})
 config = FORMAT_CONFIGS[format_name]
 if format_name == "Orlando":
     st.sidebar.caption("Orlando stock reader v32")
+    orlando_tool = st.sidebar.radio(
+        "Orlando Tool",
+        options=["Inventory Dashboard", "Item Activity Report"],
+        horizontal=False,
+        key="orlando_tool_mode",
+    )
+    if orlando_tool == "Item Activity Report":
+        render_orlando_item_activity()
+        st.stop()
 site_key = safe_format_slug(format_name).lower()
 risk_filter_key = f"{site_key}_filter_risk_levels"
 min_usage_filter_key = f"{site_key}_filter_min_usage"
